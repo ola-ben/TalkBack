@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import Peer from "peerjs";
+import { createNoiseProcessor } from "./noiseProcessor";
 
 export function usePeer() {
   const [phase, setPhase] = useState("idle"); // idle | connecting | waiting | ready | error
@@ -15,7 +16,9 @@ export function usePeer() {
   const nameRef = useRef("");
   const dataConns = useRef({});       // peerId → DataConnection
   const activeCalls = useRef({});     // peerId → MediaConnection (outgoing)
-  const localStreamRef = useRef(null);
+  const localStreamRef = useRef(null);   // the (processed) stream we send to peers
+  const rawStreamRef = useRef(null);     // the raw mic stream (for mute + cleanup)
+  const processorRef = useRef(null);     // active noise-processor { stream, stop }
   const audioRefs = useRef({});       // peerId → HTMLAudioElement
   const isTalkingRef = useRef(false);
 
@@ -208,10 +211,16 @@ export function usePeer() {
     if (isTalkingRef.current) {
       // Stop talking
       isTalkingRef.current = false;
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-        localStreamRef.current = null;
+      // Tear down the noise processor first, then the raw mic.
+      if (processorRef.current) {
+        processorRef.current.stop();
+        processorRef.current = null;
       }
+      if (rawStreamRef.current) {
+        rawStreamRef.current.getTracks().forEach((t) => t.stop());
+        rawStreamRef.current = null;
+      }
+      localStreamRef.current = null;
       // Close all outgoing calls
       Object.values(activeCalls.current).forEach((c) => c.close());
       activeCalls.current = {};
@@ -223,23 +232,36 @@ export function usePeer() {
     } else {
       // Start talking
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
+        const raw = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
-            noiseSuppression: noiseSuppress,
+            noiseSuppression: true,   // browser stage 1
             autoGainControl: true,
+            channelCount: 1,
           },
         });
-        localStreamRef.current = stream;
+        rawStreamRef.current = raw;
+
+        // Build the cleaned stream. When noise cancellation is on, run the raw
+        // mic through the full Web Audio chain (filters + gate + compressor);
+        // otherwise send the raw mic as-is.
+        let outStream = raw;
+        if (noiseSuppress) {
+          const proc = createNoiseProcessor(raw);
+          processorRef.current = proc;
+          outStream = proc.stream;
+        }
+        localStreamRef.current = outStream;
         isTalkingRef.current = true;
 
+        // Mute acts on the raw input so no signal enters the graph at all.
         if (muted) {
-          stream.getAudioTracks().forEach((t) => (t.enabled = false));
+          raw.getAudioTracks().forEach((t) => (t.enabled = false));
         }
 
-        // Call all connected peers
+        // Call all connected peers with the cleaned stream
         Object.keys(dataConns.current).forEach((peerId) => {
-          const call = peerRef.current.call(peerId, stream);
+          const call = peerRef.current.call(peerId, outStream);
           activeCalls.current[peerId] = call;
           call.on("stream", (s) => playRemoteStream(peerId, s));
         });
@@ -257,11 +279,23 @@ export function usePeer() {
     }
   }, [muted, noiseSuppress, addLog]);
 
-  const leaveRoom = useCallback(() => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
+  // Apply mute/unmute live (acts on the raw mic track) while talking.
+  useEffect(() => {
+    if (rawStreamRef.current) {
+      rawStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !muted));
     }
+  }, [muted]);
+
+  const leaveRoom = useCallback(() => {
+    if (processorRef.current) {
+      processorRef.current.stop();
+      processorRef.current = null;
+    }
+    if (rawStreamRef.current) {
+      rawStreamRef.current.getTracks().forEach((t) => t.stop());
+      rawStreamRef.current = null;
+    }
+    localStreamRef.current = null;
     isTalkingRef.current = false;
     Object.values(activeCalls.current).forEach((c) => c.close());
     activeCalls.current = {};
